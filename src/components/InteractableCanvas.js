@@ -1,11 +1,12 @@
 import React, { useRef, useEffect } from 'react'
 
+const DEFAULT_SCALING = Math.max(2, window.devicePixelRatio)
+
 /**
  * Scale the canvas to match the device's pixel ratio (for retina displays)
  * @param {HTMLCanvasElement} canvas
  */
-function scaleCanvas(canvas) {
-    const ctx = canvas.getContext('2d')
+function scaleCanvas(canvas, ctx) {
     const rect = canvas.getBoundingClientRect()
 
     // Set display size (css pixels).
@@ -13,28 +14,50 @@ function scaleCanvas(canvas) {
     canvas.style.height = rect.height + 'px'
 
     // Set actual size in memory (scaled to account for extra pixel density).
-    const scale = window.devicePixelRatio
-    canvas.width = Math.floor(rect.width * scale)
-    canvas.height = Math.floor(rect.height * scale)
+    canvas.width = Math.floor(rect.width * DEFAULT_SCALING)
+    canvas.height = Math.floor(rect.height * DEFAULT_SCALING)
 
     // Normalize coordinate system to use css pixels.
-    ctx.scale(scale, scale)
+    ctx.scale(DEFAULT_SCALING, DEFAULT_SCALING)
+    // ctx.setTransform(1, 0, 0, 1, 0, 0)
 }
 
 /**
- * Get a canvas coordinate pair taking into account the current transformations
+ * Get a canvas coordinate pair taking into account the current transformations.
+ * This will return the same coordinate pair regardless of how zoomed/panned the canvas is.
+ * For example, if the user clicked on a spot when not zoomed in at all:
+ *     getTransformedPoint(ctx, 32, 32)   => { x: 32, y: 32 }
+ * Then, they clicked on the same spot when zoomed in:
+ *     getTransformedPoint(ctx, 702, 702) => { x: 32, y: 32 }
+ * 
  * @param {CanvasRenderingContext2D} ctx
- * @param {Number} x The x coordinate of the original position
- * @param {Number} y The y coordinate of the original position
+ * @param {Number} x The x coordinate of the original position (e.g. e.offsetX)
+ * @param {Number} y The y coordinate of the original position (e.g. e.offsetY)
  * @returns {Object} The new coordinates after applying the current transformations
  */
 function getTransformedPoint(ctx, x, y) {
     const transform = ctx.getTransform()
+
+    // transform.a represents the horizontal scaling of the canvas
+    // Get the inverse so we can undo any scaling
+    // transform.d represents vertical scaling, but we always scale horizontal/vertical
+    // with the same values, so transform.a will always === transform.d
     const inverseZoom = 1 / transform.a
 
-    const transformedX = inverseZoom * x - inverseZoom * transform.e
-    const transformedY = inverseZoom * y - inverseZoom * transform.f
-    return { x: transformedX * window.devicePixelRatio, y: transformedY * window.devicePixelRatio }
+    // Return the point to normal scaling
+    let transformedX = inverseZoom * x
+
+    // Multiply by existing scaling to account for our extra pixel density as a result of scaleCanvas()
+    transformedX *= DEFAULT_SCALING
+
+    // Subtract the horizontal translation to account for panning of the canvas
+    transformedX -= inverseZoom * transform.e
+
+    let transformedY = inverseZoom * y
+    transformedY *= DEFAULT_SCALING
+    transformedY -= inverseZoom * transform.f
+
+    return { x: transformedX, y: transformedY }
 }
 
 /**
@@ -53,18 +76,25 @@ function enforceBounds(canvas, ctx) {
     // transform.f: Vertical translation (moving).
     const transform = ctx.getTransform()
 
-    // Enforce scaling bounds (can't zoom out further than default)
+    // Enforce min scaling bounds (can't zoom out further than default)
+    // We can't handle max scaling here because ctx.translate gets called 
+    // on mousewheel event and we'd need a way to undo it
     if (transform.a < 1) transform.a = 1
     if (transform.d < 1) transform.d = 1
 
     const scaledWidth = rect.width * transform.a
     const scaledHeight = rect.height * transform.d
 
-    // Enforce translation bounds (can't pan left or right past the canvas width)
+    const maxHorizontalTranslation = -(scaledWidth - rect.width) * DEFAULT_SCALING
+    const maxVerticalTranslation = -(scaledHeight - rect.height) * DEFAULT_SCALING
+
+    // Enforce horizontal translation bounds (can't pan left or right past the canvas width)
     if (transform.e > 0) transform.e = 0
-    if (transform.e < -(scaledWidth - rect.width)) transform.e = -(scaledWidth - rect.width)
+    if (transform.e < maxHorizontalTranslation) transform.e = maxHorizontalTranslation
+    
+    // Enforce horizontal vertical bounds (can't pan up or down past the canvas height)
     if (transform.f > 0) transform.f = 0
-    if (transform.f < -(scaledHeight - rect.height)) transform.f = -(scaledHeight - rect.height)
+    if (transform.f < maxVerticalTranslation) transform.f = maxVerticalTranslation
 
     ctx.setTransform(transform.a, transform.b, transform.c, transform.d, transform.e, transform.f)
 }
@@ -86,8 +116,9 @@ function drawLine(ctx, from, to, options) {
     ctx.stroke()
 }
 
-const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) => {
+const InteractableCanvas = ({ drawables, maxZoom, gridOptions, style, onContextMenu }) => {
     const canvasRef = useRef(null)
+    const maxScaleValue = maxZoom ? maxZoom : 5
 
     /**
      * Find an object that touches the given point
@@ -104,8 +135,9 @@ const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) =>
      * @param {CanvasRenderingContext2D} ctx 
      */
     const drawGrid = ctx => {
-        const canvas = canvasRef.current
-        const gridSize = canvas.width * 3
+        const rect = canvasRef.current.getBoundingClientRect()
+        const scaledWidth = rect.width * DEFAULT_SCALING
+        const scaledHeight = rect.height * DEFAULT_SCALING
 
         // Set default grid options, then insert provided options
         const drawOptions = {
@@ -116,16 +148,16 @@ const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) =>
         }
 
         // Draw vertical lines
-        for (let x = -gridSize; x < canvas.width + gridSize; x += drawOptions.cellSize) {
-            drawLine(ctx, { x: x, y: -gridSize }, { x: x, y: canvas.height + gridSize }, {
+        for (let x = 0; x < scaledWidth; x += drawOptions.cellSize) {
+            drawLine(ctx, { x: x, y: 0 }, { x: x, y: scaledHeight }, {
                 width: drawOptions.lineWidth,
                 color: drawOptions.lineColor
             })
         }
 
         // Draw horizontal lines
-        for (let y = -gridSize; y < canvas.height + gridSize; y += drawOptions.cellSize) {
-            drawLine(ctx, { x: -gridSize, y: y }, { x: canvas.width + gridSize, y: y }, {
+        for (let y = 0; y < scaledHeight; y += drawOptions.cellSize) {
+            drawLine(ctx, { x: 0, y: y }, { x: scaledWidth, y: y }, {
                 width: drawOptions.lineWidth,
                 color: drawOptions.lineColor
             })
@@ -137,7 +169,8 @@ const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) =>
      * @param {CanvasRenderingContext2D} ctx 
      */
     const draw = ctx => {
-        ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
+        ctx = canvasRef.current.getContext('2d')
+        ctx.clearRect(0, 0, ctx.canvas.width + 50, ctx.canvas.height + 50)
 
         if (gridOptions && gridOptions.draw) { drawGrid(ctx) }
 
@@ -155,7 +188,7 @@ const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) =>
     useEffect(() => {
         const canvas = canvasRef.current
         const ctx = canvas.getContext('2d')
-        scaleCanvas(canvas)
+        scaleCanvas(canvas, ctx)
 
         canvas.addEventListener('click', e => {
             const pt = getTransformedPoint(ctx, e.offsetX, e.offsetY)
@@ -163,6 +196,10 @@ const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) =>
         })
 
         canvas.addEventListener('mousewheel', e => {
+            // If zooming in and the canvas is already past max scale, do nothing
+            // We don't have to worry about minScale because enforceBounds() handles it
+            if (e.deltaY < 0 && ctx.getTransform().a > maxScaleValue) return
+
             const zoom = e.deltaY < 0 ? 1.02 : 0.98
             const pt = getTransformedPoint(ctx, e.offsetX, e.offsetY)
 
@@ -209,7 +246,6 @@ const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) =>
                 draw(ctx)
             } else if (canvas.dragStart) {
                 // Pan the canvas by the movement delta of the mouse
-                console.log('dx', pt.x - canvas.dragStart.x, 'dy', pt.y - canvas.dragStart.y)
                 ctx.translate(pt.x - canvas.dragStart.x, pt.y - canvas.dragStart.y)
                 enforceBounds(canvas, ctx)
                 draw(ctx)
@@ -236,6 +272,11 @@ const InteractableCanvas = ({ drawables, gridOptions, style, onContextMenu }) =>
         enforceBounds(canvas, ctx)
         draw(ctx)
     }, [])
+
+    // Redraw the canvas when the drawables array is changed
+    useEffect(() => {
+        draw(canvasRef.current.getContext('2d'))
+    }, [drawables])
 
     return (
         <canvas ref={canvasRef} style={style}></canvas>
